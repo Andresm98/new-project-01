@@ -1,0 +1,101 @@
+name: np01
+
+# Published ports (must match the Security Group allow list):
+#   8080 -> frontend (SPA + /api proxy to backend)
+#   8081 -> grafana
+# backend (8082) and prometheus (9090) stay on internal networks only.
+#
+# BACKEND_IMAGE / FRONTEND_IMAGE: set by CD (deploy/deploy-ec2.sh) to the GHCR
+# release; locally they default to the images built with `docker build`.
+
+x-hardening: &hardening
+  restart: unless-stopped
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+
+services:
+  backend:
+    <<: *hardening
+    build:
+      context: ./backend
+    image: ${BACKEND_IMAGE:-np01-backend:dev}
+    environment:
+      PORT: "8082"
+    read_only: true
+    networks: [app]
+
+  frontend:
+    <<: *hardening
+    build:
+      context: ./frontend
+    image: ${FRONTEND_IMAGE:-np01-frontend:dev}
+    ports:
+      - "8080:8080"
+    read_only: true
+    tmpfs:
+      - /tmp
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks: [app]
+
+  prometheus:
+    <<: *hardening
+    image: prom/prometheus:v3.16.0@sha256:e04987641b57704f408e31f6373ba4138ecf27cb4a165d24aabb6c38fddd0f06
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    read_only: true
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/-/ready"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks: [app, observability]
+
+  grafana:
+    <<: *hardening
+    image: grafana/grafana:13.3.2@sha256:81556409ba48b2b922e0adb69a2511337d8ba7578f11962eefa6149a2d815101
+    ports:
+      - "8081:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?Define GRAFANA_ADMIN_PASSWORD in .env}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_SECURITY_DISABLE_GRAVATAR: "true"
+      GF_SECURITY_COOKIE_SAMESITE: strict
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/golden-signals.json
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/api/health"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    networks: [observability]
+
+networks:
+  app:
+  observability:
+
+volumes:
+  prometheus-data:
+  grafana-data:

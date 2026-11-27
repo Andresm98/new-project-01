@@ -1,0 +1,4 @@
+# Accepted Trivy findings. Every entry needs a justification, an owner and an
+# expiry date, and must be added through a reviewed PR. Example:
+#
+# CVE-2026-00000 exp:2027-01-31  # no fix upstream; not reachable (owner: @team)

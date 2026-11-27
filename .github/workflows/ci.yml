@@ -1,0 +1,259 @@
+name: CI
+
+# Pipeline: build -> sec-check -> approve -> publish
+# sec-check is intentionally light (demo): it only blocks on insecure exposed
+# ports and leaked secrets; CVEs and Dockerfile best practices are reported.
+# - PRs run build + sec-check only (nothing is published).
+# - Pushes to main and v* tags additionally wait for manual approval in the
+#   "ci-approval" environment and then push the exact scanned images to GHCR.
+
+on:
+  pull_request:
+  push:
+    branches: [main, develop]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Pinned by digest; same image used for local verification.
+  TRIVY_IMAGE: aquasec/trivy:0.76.2@sha256:8f6bb947dbc528902e11f2f5be52f7b519f6a39d5d148f41166f2040499768fb
+  REGISTRY: ghcr.io
+  # Ports that must never be published. Keep in sync with
+  # .trivy/policies/insecure_ports.rego (FTP, SSH, Telnet, MS-RPC, NetBIOS,
+  # SMB, Docker API, RDP, VNC).
+  INSECURE_PORTS: "21 22 23 135 137 138 139 445 2375 3389 5900"
+
+jobs:
+  build:
+    name: build (${{ matrix.component }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [backend, frontend]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # build-push-action (not the raw buildx CLI) because it exposes the
+      # Actions runtime token that the "gha" cache backend needs.
+      - name: Unit tests / typecheck (Dockerfile "test" stage)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ./${{ matrix.component }}
+          target: test
+          push: false
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=${{ matrix.component }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.component }}
+
+      # provenance/sbom off: attestations turn the result into an image index,
+      # which the "docker" tar exporter cannot write.
+      - name: Build golden image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ./${{ matrix.component }}
+          target: runtime
+          push: false
+          provenance: false
+          sbom: false
+          labels: org.opencontainers.image.revision=${{ github.sha }}
+          tags: np01-${{ matrix.component }}:${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.component }}
+          outputs: type=docker,dest=${{ runner.temp }}/${{ matrix.component }}.tar
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-${{ matrix.component }}
+          path: ${{ runner.temp }}/${{ matrix.component }}.tar
+          # Must outlive the wait for approval: publish downloads it later.
+          retention-days: 14
+          if-no-files-found: error
+          # Allows "Re-run failed jobs" without a name conflict.
+          overwrite: true
+
+  sec-check:
+    name: sec-check (${{ matrix.component }})
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [backend, frontend]
+    env:
+      IMAGE: np01-${{ matrix.component }}:${{ github.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: image-${{ matrix.component }}
+          path: ${{ runner.temp }}
+
+      - name: Load image
+        run: docker load --input "${{ runner.temp }}/${{ matrix.component }}.tar"
+
+      - name: Prepare Trivy
+        run: |
+          mkdir -p "${{ runner.temp }}/trivy-cache" reports
+          # Workspace mounted read-only; reports are written by this shell via
+          # stdout redirection, so they are owned by the runner user.
+          echo "TRIVY=docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v ${{ runner.temp }}/trivy-cache:/root/.cache -v ${{ github.workspace }}:/repo:ro -w /repo ${TRIVY_IMAGE}" >> "$GITHUB_ENV"
+
+      # Report only: built-in Dockerfile checks (MEDIUM/HIGH). Never blocks.
+      - name: Trivy config (informativo)
+        continue-on-error: true
+        run: |
+          $TRIVY config --quiet --severity MEDIUM,HIGH --exit-code 0 \
+            ${{ matrix.component }}
+
+      # The only blocking rule: NP01-PORT-001 (.trivy/policies/insecure_ports.rego)
+      # fails if the Dockerfile EXPOSEs an insecure port (22, 137-139, 445, ...).
+      - name: Gate - puertos inseguros (NP01-PORT-001)
+        run: |
+          $TRIVY config --quiet \
+            --config-check .trivy/policies --check-namespaces user \
+            --format json \
+            ${{ matrix.component }} > reports/config.json
+          violations=$(jq -r '[.Results[]?.Misconfigurations[]?
+              | select(.Status == "FAIL" and (.ID | startswith("NP01-")))]
+              | .[] | "\(.ID): \(.Message)"' reports/config.json)
+          if [ -n "$violations" ]; then
+            while IFS= read -r v; do
+              echo "::error file=${{ matrix.component }}/Dockerfile::$v"
+            done <<<"$violations"
+            exit 1
+          fi
+          echo "Sin puertos inseguros expuestos."
+
+      # Report only: CVEs MEDIUM/HIGH with an available fix. Never blocks.
+      # continue-on-error: a vulnerability-DB download hiccup must not block.
+      - name: Trivy image (informativo)
+        continue-on-error: true
+        run: |
+          $TRIVY image --quiet --scanners vuln \
+            --severity MEDIUM,HIGH --ignore-unfixed --exit-code 0 \
+            "$IMAGE"
+
+      - name: Trivy SARIF reports
+        if: always()
+        continue-on-error: true
+        run: |
+          $TRIVY config --quiet --config-check .trivy/policies --check-namespaces user \
+            --format sarif ${{ matrix.component }} > reports/config.sarif
+          $TRIVY image --quiet --scanners vuln --severity MEDIUM,HIGH --ignore-unfixed \
+            --format sarif "$IMAGE" > reports/image.sarif
+
+      - name: Upload config SARIF
+        if: always() && hashFiles('reports/config.sarif') != ''
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@e274593ecfcbcdc39c8f034978d84614cebcb71d # v4.39.5
+        with:
+          sarif_file: reports/config.sarif
+          category: trivy-config-${{ matrix.component }}
+
+      - name: Upload image SARIF
+        if: always() && hashFiles('reports/image.sarif') != ''
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@e274593ecfcbcdc39c8f034978d84614cebcb71d # v4.39.5
+        with:
+          sarif_file: reports/image.sarif
+          category: trivy-image-${{ matrix.component }}
+
+  repo-policy:
+    name: sec-check (repo)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Trivy secret scan
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/repo:ro" -w /repo "$TRIVY_IMAGE" \
+            fs --quiet --scanners secret --exit-code 1 .
+
+      - name: Compose no publica puertos inseguros
+        env:
+          GRAFANA_ADMIN_PASSWORD: ci-placeholder # only needed to render the file
+        run: |
+          published=$(docker compose config --format json \
+            | jq -r '.services[] | (.ports // [])[] | .published' | sort -u)
+          echo "Puertos publicados: ${published:-ninguno}"
+          for p in $published; do
+            if grep -qw "$p" <<<"$INSECURE_PORTS"; then
+              echo "::error file=docker-compose.yml::El puerto $p es inseguro y no debe publicarse"
+              exit 1
+            fi
+          done
+
+  approve:
+    name: approve
+    needs: [sec-check, repo-policy]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-latest
+    # Required reviewers are configured on this environment (Settings > Environments).
+    environment: ci-approval
+    steps:
+      - name: Record approval
+        run: |
+          {
+            echo "### Images approved for publication"
+            echo "- Commit: \`${GITHUB_SHA}\`"
+            echo "- Ref: \`${GITHUB_REF}\`"
+            echo "- Triggered by: ${GITHUB_ACTOR}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    name: publish (${{ matrix.component }})
+    needs: approve
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        component: [backend, frontend]
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: image-${{ matrix.component }}
+          path: ${{ runner.temp }}
+
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Push the exact image that passed sec-check (no rebuild).
+      - name: Tag and push
+        env:
+          COMPONENT: ${{ matrix.component }}
+        run: |
+          docker load --input "${{ runner.temp }}/${COMPONENT}.tar"
+          repo="${REGISTRY}/${GITHUB_REPOSITORY,,}/${COMPONENT}"
+          tags=("sha-${GITHUB_SHA::7}")
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then tags+=("${GITHUB_REF_NAME#v}"); fi
+          for t in "${tags[@]}"; do
+            docker tag "np01-${COMPONENT}:${GITHUB_SHA}" "${repo}:${t}"
+            docker push "${repo}:${t}"
+            echo "- \`${repo}:${t}\`" >> "$GITHUB_STEP_SUMMARY"
+          done
